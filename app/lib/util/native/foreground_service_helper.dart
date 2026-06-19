@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/widgets.dart';
@@ -10,7 +11,10 @@ import 'package:logging/logging.dart';
 final _logger = Logger('ForegroundService');
 
 const _serviceId = 424242;
-const _channelId = 'localsend_receive_background';
+// Notification-channel importance is immutable after the channel is first
+// created, so the HIGH (heads-up) importance only takes effect on a *new*
+// channel id — hence the `_v2` suffix vs the original 'localsend_receive_background'.
+const _channelId = 'localsend_receive_v2';
 
 /// Entry point of the `flutter_foreground_task` background isolate. This runs in
 /// the foreground-service process, which survives the app being backgrounded /
@@ -59,17 +63,43 @@ class _KeepAliveTaskHandler extends TaskHandler {
 
   @override
   void onNotificationButtonPressed(String id) {
+    // Notification buttons accept ALL files (no id list); the in-app screen is
+    // what passes a selected subset (via onReceiveData below).
     _receiver.resolveDecision(id == 'accept');
   }
 
   @override
   void onNotificationPressed() {
-    // The in-app decision path is a later milestone; for now just open the app.
+    // Open the app. The main isolate buffered the latest `incoming-request`, so
+    // on resume it renders the in-app accept (or progress) screen.
     FlutterForegroundTask.launchApp();
+  }
+
+  /// Receives messages from the main isolate (`sendDataToTask`). The only one
+  /// today is the in-app accept/decline `decision`, which carries the selected
+  /// file ids so `_upload` saves exactly that subset.
+  @override
+  void onReceiveData(Object data) {
+    if (data is! String) {
+      return;
+    }
+    try {
+      final m = jsonDecode(data) as Map<String, dynamic>;
+      if (m['type'] == 'decision') {
+        final accept = m['accept'] as bool? ?? false;
+        final fileIds = (m['fileIds'] as List?)?.cast<String>();
+        _receiver.resolveDecision(accept, fileIds);
+      }
+    } catch (e, st) {
+      _logger.warning('Failed to handle data from main isolate', e, st);
+    }
   }
 
   @override
   Future<void> onDestroy(DateTime timestamp) async {
+    // Tell the main isolate the bg receiver is going away so the UI flips to
+    // "offline". Sent before stop() in case stop() throws.
+    FlutterForegroundTask.sendDataToMain(jsonEncode({'type': 'server-down'}));
     try {
       await _receiver.stop();
     } catch (e, st) {
@@ -90,6 +120,11 @@ Future<void> initForegroundService() async {
       channelId: _channelId,
       channelName: t.settingsTab.receive.runInBackground,
       channelDescription: t.settingsTab.receive.runInBackgroundDescription,
+      // HIGH importance/priority makes the Accept/Decline prompt peek (heads-up)
+      // at the top. `onlyAlertOnce` keeps the idle keep-alive notification silent,
+      // so only the transition to the prompt buzzes once.
+      channelImportance: NotificationChannelImportance.HIGH,
+      priority: NotificationPriority.HIGH,
       onlyAlertOnce: true,
     ),
     iosNotificationOptions: const IOSNotificationOptions(

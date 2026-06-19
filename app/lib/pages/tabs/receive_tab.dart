@@ -56,7 +56,7 @@ class ReceiveTab extends StatelessWidget {
                               final activeTab = ref.watch(homePageControllerProvider.select((state) => state.currentTab));
                               return RotatingWidget(
                                 duration: const Duration(seconds: 15),
-                                spinning: vm.serverState != null && animations && activeTab == HomeTab.receive,
+                                spinning: vm.online && animations && activeTab == HomeTab.receive,
                                 child: const LocalSendLogo(withText: false),
                               );
                             },
@@ -64,13 +64,13 @@ class ReceiveTab extends StatelessWidget {
                         ),
                         FittedBox(
                           fit: BoxFit.scaleDown,
-                          child: Text(vm.serverState?.alias ?? vm.aliasSettings, style: const TextStyle(fontSize: 48)),
+                          child: Text(vm.displayAlias, style: const TextStyle(fontSize: 48)),
                         ),
                         InitialFadeTransition(
                           duration: const Duration(milliseconds: 300),
                           delay: const Duration(milliseconds: 500),
                           child: Text(
-                            vm.serverState == null ? t.general.offline : vm.localIps.map((ip) => '#${ip.visualId}').toSet().join(' '),
+                            !vm.online ? t.general.offline : vm.localIps.map((ip) => '#${ip.visualId}').toSet().join(' '),
                             style: const TextStyle(fontSize: 24),
                             textAlign: TextAlign.center,
                           ),

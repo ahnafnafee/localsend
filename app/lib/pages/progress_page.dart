@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:localsend_app/config/theme.dart';
 import 'package:localsend_app/gen/strings.g.dart';
 import 'package:localsend_app/model/state/server/receive_session_state.dart';
+import 'package:localsend_app/provider/background_session_provider.dart';
 import 'package:localsend_app/provider/network/send_provider.dart';
 import 'package:localsend_app/provider/network/server/server_provider.dart';
 import 'package:localsend_app/provider/progress_provider.dart';
@@ -47,6 +48,10 @@ class ProgressPage extends StatefulWidget {
 }
 
 class _ProgressPageState extends State<ProgressPage> with Refena {
+  /// The effective receive session: the foreground server's session if present,
+  /// otherwise the background-isolate mirror (Android background receiving).
+  ReceiveSessionState? get _receiveSession => ref.read(serverProvider)?.session ?? ref.read(backgroundSessionProvider).session;
+
   int _totalBytes = double.maxFinite.toInt();
   int _lastRemainingTimeUpdate = 0; // millis since epoch
   String? _remainingTime;
@@ -74,7 +79,7 @@ class _ProgressPageState extends State<ProgressPage> with Refena {
       // Periodically call WakelockPlus.enable() to keep the screen awake
       _wakelockPlusTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
         final finished =
-            ref.read(serverProvider)?.session?.files.values.map((e) => e.status).isFinishedOrSkipped ??
+            _receiveSession?.files.values.map((e) => e.status).isFinishedOrSkipped ??
             ref.read(sendProvider)[widget.sessionId]?.files.values.map((e) => e.status).isFinishedOrSkipped ??
             true;
         if (finished) {
@@ -92,7 +97,7 @@ class _ProgressPageState extends State<ProgressPage> with Refena {
       if (ref.read(settingsProvider).autoFinish) {
         _finishTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
           final finished =
-              ref.read(serverProvider)?.session?.files.values.map((e) => e.status).isFinishedOrSkipped ??
+              _receiveSession?.files.values.map((e) => e.status).isFinishedOrSkipped ??
               ref.read(sendProvider)[widget.sessionId]?.files.values.map((e) => e.status).isFinishedOrSkipped ??
               true;
           if (finished) {
@@ -109,7 +114,7 @@ class _ProgressPageState extends State<ProgressPage> with Refena {
       }
 
       setState(() {
-        final receiveSession = ref.read(serverProvider)?.session;
+        final receiveSession = _receiveSession;
         if (receiveSession != null) {
           _files = receiveSession.files.values.map((f) => f.file).toList();
 
@@ -129,7 +134,7 @@ class _ProgressPageState extends State<ProgressPage> with Refena {
   }
 
   void _exit({required bool closeSession}) async {
-    final receiveSession = ref.read(serverProvider.select((s) => s?.session));
+    final receiveSession = _receiveSession;
     final sendSession = ref.read(sendProvider)[widget.sessionId];
     final SessionStatus? status = receiveSession?.status ?? sendSession?.status;
     final keepSession = !closeSession && (status == SessionStatus.sending || status == SessionStatus.finishedWithErrors);
@@ -147,15 +152,22 @@ class _ProgressPageState extends State<ProgressPage> with Refena {
       false => true,
     };
     if (result) {
-      final receiveSession = ref.read(serverProvider)?.session;
+      final foregroundReceiveSession = ref.read(serverProvider)?.session;
+      final backgroundReceiveSession = ref.read(backgroundSessionProvider).session;
       final sendState = ref.read(sendProvider)[widget.sessionId];
 
-      if (receiveSession != null) {
-        if (receiveSession.status == SessionStatus.sending) {
+      if (foregroundReceiveSession != null) {
+        if (foregroundReceiveSession.status == SessionStatus.sending) {
           ref.notifier(serverProvider).cancelSession();
         } else {
           ref.notifier(serverProvider).closeSession();
         }
+      } else if (backgroundReceiveSession != null) {
+        // The background isolate owns the transfer; the contract has no
+        // main→bg cancel, so dismissing just clears the mirror. (A finished
+        // transfer is the common case here.)
+        ref.notifier(backgroundSessionProvider).clear();
+        ref.notifier(progressProvider).removeSession(widget.sessionId);
       } else if (sendState != null) {
         if (sendState.status == SessionStatus.sending) {
           ref.notifier(sendProvider).cancelSession(widget.sessionId);
@@ -186,7 +198,10 @@ class _ProgressPageState extends State<ProgressPage> with Refena {
       (prev, curr) => prev + ((progressNotifier.getProgress(sessionId: widget.sessionId, fileId: curr.id) * curr.size).round()),
     );
 
-    final receiveSession = ref.watch(serverProvider.select((s) => s?.session));
+    // Fall back to the background-isolate mirror session when the main server
+    // has none (Android "keep receiving in the background"). The foreground path
+    // is unaffected: serverProvider.session takes precedence whenever it exists.
+    final receiveSession = ref.watch(serverProvider.select((s) => s?.session)) ?? ref.watch(backgroundSessionProvider.select((s) => s.session));
     final sendSession = ref.watch(sendProvider)[widget.sessionId];
 
     final SessionState? commonSessionState = receiveSession ?? sendSession;

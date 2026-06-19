@@ -15,7 +15,6 @@ import 'package:dart_mappable/dart_mappable.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
@@ -29,6 +28,7 @@ const _uuid = Uuid();
 const _kSecurityContext = 'ls_security_context';
 const _kPort = 'ls_port';
 const _kAlias = 'ls_alias';
+const _kDestination = 'ls_destination';
 
 // Gating keys, read fresh on each prepare-upload so toggles made in the app's
 // UI take effect in this isolate. Must match [PersistenceService].
@@ -39,6 +39,17 @@ const _kFavorites = 'ls_favorites';
 // How long the notification prompt waits for the user before defaulting to a
 // decline.
 const _decisionTimeout = Duration(seconds: 60);
+
+// Progress throttling. `progress` events to the main isolate are emitted at most
+// once per [_progressByteInterval] OR [_progressTimeInterval] (whichever comes
+// first), so a fast LAN transfer doesn't flood the isolate channel per chunk.
+const _progressByteInterval = 64 * 1024; // ~64KB
+const _progressTimeInterval = Duration(milliseconds: 100);
+
+// The service-notification text is rewritten far less often (every ~5% or 1s),
+// since updateService is comparatively expensive and the notification only needs
+// a coarse percentage.
+const _notificationInterval = Duration(seconds: 1);
 
 class _IncomingFile {
   final FileDto dto;
@@ -53,6 +64,10 @@ class _Session {
   final String senderIp;
   final String senderAlias;
   final Map<String, _IncomingFile> files;
+
+  /// File ids the user chose to save (null = save all). Set when the decision is
+  /// resolved; `_upload` skips any file id not contained here.
+  Set<String>? selectedFileIds;
 
   _Session({
     required this.sessionId,
@@ -86,7 +101,23 @@ class BackgroundReceiver {
   /// decision. Guards against more than one prompt being pending at a time.
   Completer<bool>? _pendingDecision;
 
+  /// File ids selected by the in-app accept screen for the pending decision
+  /// (null = all). Read once when the decision resolves, then folded into the
+  /// session so `_upload` only saves the chosen files. Notification-button
+  /// accepts leave this null (accept all).
+  List<String>? _pendingFileIds;
+
+  /// Session id of the pending prompt, so [resolveDecision] can tell the main
+  /// isolate which session was accepted/declined (the notification buttons
+  /// otherwise carry no session context).
+  String? _pendingSessionId;
+
+  /// Session ids that had at least one failed file, so `session-finished` can
+  /// report `hasError`. Cleared when the session finishes.
+  final Set<String> _failedFileIds = {};
+
   String _alias = 'LocalSend';
+  int _port = defaultPort;
   String _fingerprint = '';
   late Directory _destination;
 
@@ -103,28 +134,40 @@ class BackgroundReceiver {
     final ctx = _readSecurityContext(prefs);
     _fingerprint = ctx.certificateHash;
     _alias = prefs.getString(_kAlias) ?? 'LocalSend';
-    final port = prefs.getInt(_kPort) ?? defaultPort;
+    _port = prefs.getInt(_kPort) ?? defaultPort;
 
-    _destination = await _resolveDestinationDir();
+    _destination = await _resolveDestinationDir(prefs);
     await _destination.create(recursive: true);
 
     final securityContext = SecurityContext()
       ..usePrivateKeyBytes(ctx.privateKey.codeUnits)
       ..useCertificateChainBytes(ctx.certificate.codeUnits);
 
-    _server = await HttpServer.bindSecure('0.0.0.0', port, securityContext);
+    _server = await HttpServer.bindSecure('0.0.0.0', _port, securityContext);
     _server!.listen(
       (req) => _handle(req).catchError((Object e) => _safeError(req, e)),
       onError: (Object e) => _logger.warning('Server error', e),
     );
 
-    _logger.info('Background receiver started on port $port (alias "$_alias"). Saving to: ${_destination.path}');
+    _logger.info('Background receiver started on port $_port (alias "$_alias"). Saving to: ${_destination.path}');
+
+    // Tell the main isolate the server is up so the UI can show "online" while
+    // this isolate owns the receive port.
+    FlutterForegroundTask.sendDataToMain(jsonEncode({'type': 'server-up', 'alias': _alias, 'port': _port}));
   }
 
   Future<void> stop() async {
+    final session = _session;
     _session = null;
+    // If a transfer (or pending prompt) was in flight, tell the main isolate so
+    // it can clear its mirror and pop any visible accept/progress screen.
+    if (session != null) {
+      _failedFileIds.remove(session.sessionId);
+      FlutterForegroundTask.sendDataToMain(jsonEncode({'type': 'canceled', 'sessionId': session.sessionId}));
+    }
     await _server?.close(force: true);
     _server = null;
+    FlutterForegroundTask.sendDataToMain(jsonEncode({'type': 'server-down'}));
     _logger.info('Background receiver stopped.');
   }
 
@@ -150,12 +193,17 @@ class BackgroundReceiver {
     return StoredSecurityContext.fromJson(jsonDecode(raw) as Map<String, dynamic>);
   }
 
-  /// The app-specific external storage dir + a `LocalSend` subdir. No
-  /// gallery/SAF/MediaStore — plain file writes for Milestone 1.
-  Future<Directory> _resolveDestinationDir() async {
-    final external = await getExternalStorageDirectory();
-    final base = external?.path ?? (await getApplicationDocumentsDirectory()).path;
-    return Directory(p.join(base, 'LocalSend'));
+  /// Resolves the save directory. Honors the user's configured destination
+  /// (`ls_destination`, shared with the foreground app) as-is; otherwise
+  /// defaults to the public `Download/LocalSend`. Android permits direct writes
+  /// under `/storage/emulated/0/Download` without all-files-access — saving
+  /// anywhere outside it would require the broader permission.
+  Future<Directory> _resolveDestinationDir(SharedPreferences prefs) async {
+    final configured = prefs.getString(_kDestination);
+    if (configured != null && configured.isNotEmpty) {
+      return Directory(configured);
+    }
+    return Directory(p.join('/storage/emulated/0/Download', 'LocalSend'));
   }
 
   // --- routing -------------------------------------------------------------
@@ -223,16 +271,30 @@ class BackgroundReceiver {
 
     final senderIp = _ipOf(req);
 
-    final accepted = await _decide(dto);
+    // The sessionId is generated up front (before the decision) so the in-app
+    // accept screen, the `decision` reply, and the `progress` events all share
+    // the same id — the main isolate builds its mirror session keyed on it.
+    final sessionId = _uuid.v4();
+
+    final accepted = await _decide(dto, sessionId, senderIp);
     if (!accepted) {
       _logger.info('Declined: ${dto.files.length} file(s) from "${dto.info.alias}" ($senderIp)');
       return _respond(req, 403, message: 'File request declined by recipient');
     }
 
-    final sessionId = _uuid.v4();
+    // The user may have chosen a subset of files in the in-app accept screen.
+    // Notification-button accepts leave this null, meaning "save all".
+    final selectedFileIds = _pendingFileIds;
+    _pendingFileIds = null;
+
     final files = <String, _IncomingFile>{};
     final responseFiles = <String, String>{};
     for (final entry in dto.files.entries) {
+      if (selectedFileIds != null && !selectedFileIds.contains(entry.key)) {
+        // File was deselected in the in-app accept screen: don't issue a token,
+        // so the sender skips it (mirrors the foreground "skipped" behavior).
+        continue;
+      }
       final token = _uuid.v4();
       files[entry.key] = _IncomingFile(entry.value, token);
       responseFiles[entry.key] = token;
@@ -242,9 +304,9 @@ class BackgroundReceiver {
       senderIp: senderIp,
       senderAlias: dto.info.alias,
       files: files,
-    );
+    )..selectedFileIds = selectedFileIds?.toSet();
 
-    _logger.info('Accepted: ${dto.files.length} file(s) from "${dto.info.alias}" ($senderIp)');
+    _logger.info('Accepted: ${files.length} file(s) from "${dto.info.alias}" ($senderIp)');
 
     if (legacy) {
       await _respond(req, 200, body: responseFiles);
@@ -255,8 +317,9 @@ class BackgroundReceiver {
 
   /// Decides whether to accept [dto]. Auto-accepts when quick-save (or
   /// quick-save-from-favorites for a known sender) is enabled; otherwise prompts
-  /// the user via the foreground-service notification and blocks on their choice.
-  Future<bool> _decide(PrepareUploadRequestDto dto) async {
+  /// the user via the foreground-service notification and (in parallel) the
+  /// in-app accept screen, blocking on whichever resolves first.
+  Future<bool> _decide(PrepareUploadRequestDto dto, String sessionId, String senderIp) async {
     final prefs = await SharedPreferences.getInstance();
     // Re-read settings each time so toggles made in the app's UI take effect.
     await prefs.reload();
@@ -269,7 +332,7 @@ class BackgroundReceiver {
       return true;
     }
 
-    return _promptUser(dto);
+    return _promptUser(dto, sessionId, senderIp);
   }
 
   /// Returns true if [fingerprint] is among the stored favorites. The favorites
@@ -300,9 +363,29 @@ class BackgroundReceiver {
   /// Shows Accept/Decline buttons on the foreground-service notification and
   /// waits (up to [_decisionTimeout]) for [resolveDecision] to be called from
   /// the TaskHandler. Reverts the notification to its idle state afterwards.
-  Future<bool> _promptUser(PrepareUploadRequestDto dto) async {
+  ///
+  /// Before blocking, it pushes an `incoming-request` event to the main isolate
+  /// so the app can render its own accept screen; the user can decide there
+  /// (via `sendDataToTask` → [resolveDecision]) or on the notification buttons —
+  /// whichever happens first resolves the same completer.
+  Future<bool> _promptUser(PrepareUploadRequestDto dto, String sessionId, String senderIp) async {
     final completer = Completer<bool>();
     _pendingDecision = completer;
+    _pendingSessionId = sessionId;
+
+    // Notify the main isolate so the in-app accept UI can be shown. The file
+    // list is serialized with the same FileDto mapper the wire uses, so the main
+    // isolate can rebuild lossless FileDto objects.
+    FlutterForegroundTask.sendDataToMain(jsonEncode({
+      'type': 'incoming-request',
+      'sessionId': sessionId,
+      'alias': dto.info.alias,
+      'fingerprint': dto.info.fingerprint,
+      'ip': senderIp,
+      'files': [
+        for (final f in dto.files.values) const FileDtoMapper().encode(f),
+      ],
+    }));
 
     await FlutterForegroundTask.updateService(
       notificationTitle: 'Incoming files from ${dto.info.alias}',
@@ -318,6 +401,7 @@ class BackgroundReceiver {
       result = await completer.future.timeout(_decisionTimeout, onTimeout: () => false);
     } finally {
       _pendingDecision = null;
+      _pendingSessionId = null;
       await FlutterForegroundTask.updateService(
         notificationTitle: 'LocalSend',
         notificationText: 'Receiving in the background',
@@ -327,11 +411,25 @@ class BackgroundReceiver {
     return result;
   }
 
-  /// Completes a pending decision (called from the TaskHandler when a
-  /// notification button is pressed). No-op if no prompt is pending.
-  void resolveDecision(bool accept) {
+  /// Completes a pending decision. Called from the TaskHandler when a
+  /// notification button is pressed (no [fileIds] → save all) or when the main
+  /// isolate relays the in-app decision via `sendDataToTask` ([fileIds] = the
+  /// selected ids). No-op if no prompt is pending. A null [fileIds] (or any
+  /// decline) means "all files".
+  void resolveDecision(bool accept, [List<String>? fileIds]) {
     final completer = _pendingDecision;
     if (completer != null && !completer.isCompleted) {
+      _pendingFileIds = accept ? fileIds : null;
+      // Tell the main isolate the outcome so the in-app UI navigates and the
+      // resume/tap-to-open path knows whether to show the accept screen or the
+      // progress screen. Emitted for BOTH the notification buttons and the
+      // in-app accept screen, since both funnel through here.
+      final sessionId = _pendingSessionId;
+      if (sessionId != null) {
+        FlutterForegroundTask.sendDataToMain(jsonEncode(accept
+            ? {'type': 'accepted', 'sessionId': sessionId, 'fileIds': fileIds}
+            : {'type': 'declined', 'sessionId': sessionId}));
+      }
       completer.complete(accept);
     }
   }
@@ -363,31 +461,117 @@ class BackgroundReceiver {
       return _respond(req, 403, message: 'Invalid session id');
     }
     final incoming = fileId == null ? null : session.files[fileId];
-    if (incoming == null || incoming.token != token) {
+    if (incoming == null || fileId == null || incoming.token != token) {
       return _respond(req, 403, message: 'Invalid token');
     }
 
-    final destPath = await _resolveDestinationPath(incoming.dto.fileName);
+    final total = incoming.dto.size;
+    final fileName = incoming.dto.fileName;
+
+    // Tell the main isolate this file started transferring so its mirror flips
+    // the file to "sending" and the progress bar appears.
+    _sendFileStatus(session.sessionId, fileId, 'sending');
+
+    final destPath = await _resolveDestinationPath(fileName);
     final sink = File(destPath).openWrite();
+    var received = 0;
+    var lastProgressBytes = 0;
+    var lastProgressAt = DateTime.now();
+    var lastNotificationPercent = -1;
+    var lastNotificationAt = DateTime.fromMillisecondsSinceEpoch(0);
     try {
-      await sink.addStream(req);
+      // Chunked loop (instead of sink.addStream) so we can observe bytes as they
+      // arrive and emit THROTTLED progress — both to the main isolate (every
+      // ~64KB or ~100ms) and to the service notification text (every ~5% or 1s).
+      await for (final chunk in req) {
+        sink.add(chunk);
+        received += chunk.length;
+
+        final now = DateTime.now();
+        if (received - lastProgressBytes >= _progressByteInterval || now.difference(lastProgressAt) >= _progressTimeInterval) {
+          lastProgressBytes = received;
+          lastProgressAt = now;
+          _sendProgress(session.sessionId, fileId, received, total);
+        }
+
+        if (total > 0) {
+          final percent = (received * 100 ~/ total);
+          if (percent - lastNotificationPercent >= 5 || now.difference(lastNotificationAt) >= _notificationInterval) {
+            lastNotificationPercent = percent;
+            lastNotificationAt = now;
+            // ignore: discarded_futures, unawaited_futures
+            FlutterForegroundTask.updateService(notificationText: 'Receiving $fileName — $percent%');
+          }
+        }
+      }
       await sink.flush();
       await sink.close();
     } catch (e) {
       try {
         await sink.close();
       } catch (_) {}
+      incoming.done = true;
+      _sendFileStatus(session.sessionId, fileId, 'failed');
+      _maybeFinishSession(session);
       return _respond(req, 500, message: 'Could not save file: $e');
     }
 
+    // Emit a final 100% so the bar lands exactly full regardless of throttling.
+    _sendProgress(session.sessionId, fileId, total, total);
+
     incoming.done = true;
+    _sendFileStatus(session.sessionId, fileId, 'finished');
     _logger.info('Saved: $destPath');
     await _respond(req, 200);
 
-    if (session.files.values.every((f) => f.done)) {
-      _logger.info('Session complete (${session.files.length} file(s)) from "${session.senderAlias}".');
+    _maybeFinishSession(session);
+  }
+
+  /// Closes the session once every file is done and tells the main isolate the
+  /// session finished (so the in-app ProgressPage shows the completed state).
+  void _maybeFinishSession(_Session session) {
+    if (!session.files.values.every((f) => f.done)) {
+      return;
+    }
+    final hasError = _failedFileIds.contains(session.sessionId);
+    _failedFileIds.remove(session.sessionId);
+    _logger.info('Session complete (${session.files.length} file(s)) from "${session.senderAlias}".');
+    FlutterForegroundTask.sendDataToMain(jsonEncode({
+      'type': 'session-finished',
+      'sessionId': session.sessionId,
+      'hasError': hasError,
+    }));
+    // ignore: discarded_futures
+    FlutterForegroundTask.updateService(
+      notificationTitle: 'LocalSend',
+      notificationText: 'Receiving in the background',
+      notificationButtons: const [],
+    );
+    if (identical(_session, session)) {
       _session = null;
     }
+  }
+
+  void _sendProgress(String sessionId, String fileId, int received, int total) {
+    FlutterForegroundTask.sendDataToMain(jsonEncode({
+      'type': 'progress',
+      'sessionId': sessionId,
+      'fileId': fileId,
+      'received': received,
+      'total': total,
+    }));
+  }
+
+  void _sendFileStatus(String sessionId, String fileId, String status) {
+    if (status == 'failed') {
+      _failedFileIds.add(sessionId);
+    }
+    FlutterForegroundTask.sendDataToMain(jsonEncode({
+      'type': 'file-status',
+      'sessionId': sessionId,
+      'fileId': fileId,
+      'status': status,
+    }));
   }
 
   Future<void> _cancel(HttpRequest req) async {
@@ -398,6 +582,8 @@ class BackgroundReceiver {
     }
     _logger.info('Sender "${session.senderAlias}" canceled the session.');
     _session = null;
+    _failedFileIds.remove(session.sessionId);
+    FlutterForegroundTask.sendDataToMain(jsonEncode({'type': 'canceled', 'sessionId': session.sessionId}));
     await _respond(req, 200);
   }
 

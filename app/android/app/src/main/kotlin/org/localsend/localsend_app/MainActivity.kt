@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
@@ -21,6 +23,14 @@ private const val REQUEST_CODE_PICK_FILE = 3
 
 class MainActivity : FlutterActivity() {
     private var pendingResult: MethodChannel.Result? = null
+
+    // WiFi lock held only while the app is in the foreground. On Android 10+ this
+    // requests LOW_LATENCY mode, which keeps the WiFi radio out of power-save while
+    // the user is actively watching a transfer (the receive progress screen) —
+    // markedly improving WiFi throughput/latency. Background receiving is already
+    // covered by the foreground service's FULL_HIGH_PERF lock; LOW_LATENCY only
+    // takes effect while the app is foreground, so it's scoped to onResume/onPause.
+    private var wifiLock: WifiManager.WifiLock? = null
 
     // Overriding the static methods we need from the Java class, as described
     // in the documentation of `FlutterActivity.NewEngineIntentBuilder`
@@ -75,6 +85,36 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        acquireWifiLock()
+    }
+
+    override fun onPause() {
+        releaseWifiLock()
+        super.onPause()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wifiLock = wifiManager.createWifiLock(mode, "localsend:foregroundWifiLock").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
     }
 
     private fun isAnimationsEnabled() : Boolean {

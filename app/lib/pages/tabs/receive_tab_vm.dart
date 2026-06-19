@@ -1,6 +1,7 @@
 import 'package:common/util/sleep.dart';
 import 'package:flutter/material.dart';
 import 'package:localsend_app/model/state/server/server_state.dart';
+import 'package:localsend_app/provider/background_receiver_provider.dart';
 import 'package:localsend_app/provider/local_ip_provider.dart';
 import 'package:localsend_app/provider/network/server/server_provider.dart';
 import 'package:localsend_app/provider/settings_provider.dart';
@@ -20,6 +21,7 @@ class ReceiveTabVm {
   final bool quickSaveSettings;
   final bool quickSaveFromFavoritesSettings;
   final ServerState? serverState;
+  final BackgroundReceiverState backgroundReceiverState;
   final List<String> localIps;
   final bool showAdvanced;
   final bool showHistoryButton;
@@ -32,6 +34,7 @@ class ReceiveTabVm {
     required this.quickSaveSettings,
     required this.quickSaveFromFavoritesSettings,
     required this.serverState,
+    required this.backgroundReceiverState,
     required this.localIps,
     required this.showAdvanced,
     required this.showHistoryButton,
@@ -39,12 +42,21 @@ class ReceiveTabVm {
     required this.onSetQuickSave,
     required this.onSetQuickSaveFromFavorites,
   });
+
+  /// True when receiving is active either via the main-isolate server or the
+  /// background-receive isolate (Android, "keep receiving in the background").
+  bool get online => serverState != null || backgroundReceiverState.online;
+
+  /// The alias to show as the device name: the main server's alias if running,
+  /// otherwise the background receiver's alias, falling back to the setting.
+  String get displayAlias => serverState?.alias ?? backgroundReceiverState.alias ?? aliasSettings;
 }
 
 final receiveTabVmProvider = ViewProvider((ref) {
   final (alias, quickSave, quickSaveFromFavorites) = ref.watch(settingsProvider.select((s) => (s.alias, s.quickSave, s.quickSaveFromFavorites)));
   final networkInfo = ref.watch(localIpProvider).localIps;
   final serverState = ref.watch(serverProvider);
+  final backgroundReceiverState = ref.watch(backgroundReceiverProvider);
   final showAdvanced = ref.watch(_showAdvancedProvider);
   final showHistoryButton = ref.watch(_showHistoryButtonProvider);
 
@@ -53,6 +65,7 @@ final receiveTabVmProvider = ViewProvider((ref) {
     quickSaveSettings: quickSave,
     quickSaveFromFavoritesSettings: quickSaveFromFavorites,
     serverState: serverState,
+    backgroundReceiverState: backgroundReceiverState,
     localIps: networkInfo,
     showAdvanced: showAdvanced,
     showHistoryButton: showHistoryButton,

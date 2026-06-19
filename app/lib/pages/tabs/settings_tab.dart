@@ -14,6 +14,7 @@ import 'package:localsend_app/pages/donation/donation_page.dart';
 import 'package:localsend_app/pages/language_page.dart';
 import 'package:localsend_app/pages/settings/network_interfaces_page.dart';
 import 'package:localsend_app/pages/tabs/settings_tab_controller.dart';
+import 'package:localsend_app/provider/background_receiver_provider.dart';
 import 'package:localsend_app/provider/settings_provider.dart';
 import 'package:localsend_app/provider/version_provider.dart';
 import 'package:localsend_app/util/alias_generator.dart';
@@ -293,7 +294,10 @@ class SettingsTab extends StatelessWidget {
                         ),
                       ),
                       _SettingsEntry(
-                        label: '${t.settingsTab.network.server}${vm.serverState == null ? ' (${t.general.offline})' : ''}',
+                        // "Online" also when the Android background-receive isolate owns the
+                        // port (then vm.serverState is null but the bg receiver is serving).
+                        label:
+                            '${t.settingsTab.network.server}${vm.serverState == null && !ref.watch(backgroundReceiverProvider).online ? ' (${t.general.offline})' : ''}',
                         child: DecoratedBox(
                           decoration: BoxDecoration(
                             color: Theme.of(context).inputDecorationTheme.fillColor,

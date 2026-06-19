@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:common/isolate.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:localsend_app/config/init.dart';
 import 'package:localsend_app/config/init_error.dart';
@@ -9,6 +12,8 @@ import 'package:localsend_app/model/persistence/color_mode.dart';
 import 'package:localsend_app/pages/home_page.dart';
 import 'package:localsend_app/provider/local_ip_provider.dart';
 import 'package:localsend_app/provider/settings_provider.dart';
+import 'package:localsend_app/util/native/foreground_service_helper.dart';
+import 'package:localsend_app/util/native/platform_check.dart';
 import 'package:localsend_app/util/ui/dynamic_colors.dart';
 import 'package:localsend_app/widget/watcher/life_cycle_watcher.dart';
 import 'package:localsend_app/widget/watcher/shortcut_watcher.dart';
@@ -27,6 +32,12 @@ Future<void> main(List<String> args) async {
       stackTrace: stackTrace,
     );
     return;
+  }
+
+  if (checkPlatform([TargetPlatform.android])) {
+    // Initialize the foreground service used by the "keep receiving in the background" setting.
+    FlutterForegroundTask.initCommunicationPort();
+    await initForegroundService();
   }
 
   runApp(
@@ -54,6 +65,13 @@ class LocalSendApp extends StatelessWidget {
             switch (state) {
               case AppLifecycleState.resumed:
                 ref.redux(localIpProvider).dispatch(InitLocalIpAction());
+                // Ensure the foreground service is running whenever the user enabled
+                // background receiving. Starting it here (a foreground context) avoids
+                // Android 12+'s restriction on starting a foreground service from the
+                // background; it then survives the app being backgrounded.
+                if (checkPlatform([TargetPlatform.android]) && ref.read(settingsProvider).runInBackground) {
+                  unawaited(startBackgroundService());
+                }
                 break;
               case AppLifecycleState.detached:
                 // The main isolate is only exited when all child isolates are exited.

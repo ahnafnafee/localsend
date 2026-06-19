@@ -120,7 +120,9 @@
       "destination": "Save to folder",
       "downloads": "(Downloads)",
       "saveToGallery": "Save media to gallery",
-      "saveToHistory": "Save to history"
+      "saveToHistory": "Save to history",
+      "runInBackground": "Keep receiving in the background",
+      "runInBackgroundDescription": "Runs a foreground service so LocalSend can keep receiving files while the app is in the background. A persistent notification is shown while active."
     },
     "send": {
       "title": "Send",

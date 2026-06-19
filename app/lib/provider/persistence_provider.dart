@@ -78,6 +78,7 @@ const _multicastGroupKey = 'ls_multicast_group';
 const _destinationKey = 'ls_destination';
 const _saveToGallery = 'ls_save_to_gallery';
 const _saveToHistory = 'ls_save_to_history';
+const _runInBackground = 'ls_run_in_background';
 const _quickSave = 'ls_quick_save';
 const _quickSaveFromFavorites = 'ls_quick_save_from_favorites';
 const _receivePin = 'ls_receive_pin';
@@ -401,6 +402,14 @@ class PersistenceService {
 
   Future<void> setSaveToHistory(bool saveToHistory) async {
     await _prefs.setBool(_saveToHistory, saveToHistory);
+  }
+
+  bool isRunInBackground() {
+    return _prefs.getBool(_runInBackground) ?? false;
+  }
+
+  Future<void> setRunInBackground(bool value) async {
+    await _prefs.setBool(_runInBackground, value);
   }
 
   bool getAdvancedSettingsEnabled() {

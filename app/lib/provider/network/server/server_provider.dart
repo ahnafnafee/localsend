@@ -95,6 +95,15 @@ class ServerService extends Notifier<ServerState?> {
       return null;
     }
 
+    // When "keep receiving in the background" is enabled (Android), the
+    // foreground-service background isolate owns the receive port. The main
+    // isolate must NOT also bind it, or both collide on the same (address,
+    // port) within the process ("The shared flag to bind() needs to be `true`").
+    if (Platform.isAndroid && ref.read(settingsProvider).runInBackground) {
+      _logger.info('Background receive is on; the service isolate owns the port. Not starting the main-isolate server.');
+      return null;
+    }
+
     alias = alias.trim();
     if (alias.isEmpty) {
       alias = generateRandomAlias();

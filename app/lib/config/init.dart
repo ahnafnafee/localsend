@@ -42,6 +42,7 @@ import 'package:localsend_app/util/native/content_uri_helper.dart';
 import 'package:localsend_app/util/native/context_menu_helper.dart';
 import 'package:localsend_app/util/native/cross_file_converters.dart';
 import 'package:localsend_app/util/native/device_info_helper.dart';
+import 'package:localsend_app/util/native/foreground_service_helper.dart';
 import 'package:localsend_app/util/native/macos_channel.dart';
 import 'package:localsend_app/util/native/platform_check.dart';
 import 'package:localsend_app/util/native/tray_helper.dart';
@@ -211,11 +212,25 @@ Future<void> postInit(BuildContext context, Ref ref, bool appStart) async {
     }
   }
 
-  try {
-    await ref.notifier(serverProvider).startServerFromSettings();
-  } catch (e) {
-    if (context.mounted) {
-      context.showSnackBar(e.toString());
+  // On Android, when "Keep receiving in the background" is on, the background
+  // isolate (foreground-service TaskHandler) OWNS the receive server and binds
+  // the port. The main isolate must NOT start its own server, or the bind would
+  // conflict. Instead, ensure the foreground service is running (this is a
+  // foreground context, so starting it here is allowed).
+  final runInBackground = checkPlatform([TargetPlatform.android]) && ref.read(settingsProvider).runInBackground;
+  if (runInBackground) {
+    try {
+      await startBackgroundService();
+    } catch (e) {
+      _logger.warning('Starting foreground service failed', e);
+    }
+  } else {
+    try {
+      await ref.notifier(serverProvider).startServerFromSettings();
+    } catch (e) {
+      if (context.mounted) {
+        context.showSnackBar(e.toString());
+      }
     }
   }
 

@@ -6,7 +6,10 @@ import 'package:localsend_app/gen/strings.g.dart';
 import 'package:localsend_app/model/persistence/color_mode.dart';
 import 'package:localsend_app/model/send_mode.dart';
 import 'package:localsend_app/model/state/settings_state.dart';
+import 'package:localsend_app/provider/network/server/server_provider.dart';
 import 'package:localsend_app/provider/persistence_provider.dart';
+import 'package:localsend_app/util/native/foreground_service_helper.dart';
+import 'package:localsend_app/util/native/platform_check.dart';
 import 'package:refena_flutter/refena_flutter.dart';
 
 final _listEq = const ListEquality().equals;
@@ -56,6 +59,7 @@ class SettingsService extends PureNotifier<SettingsState> {
     destination: _persistence.getDestination(),
     saveToGallery: _persistence.isSaveToGallery(),
     saveToHistory: _persistence.isSaveToHistory(),
+    runInBackground: _persistence.isRunInBackground(),
     quickSave: _persistence.isQuickSave(),
     quickSaveFromFavorites: _persistence.isQuickSaveFromFavorites(),
     receivePin: _persistence.getReceivePin(),
@@ -161,6 +165,38 @@ class SettingsService extends PureNotifier<SettingsState> {
     state = state.copyWith(
       saveToHistory: saveToHistory,
     );
+  }
+
+  /// Toggles "Keep receiving in the background".
+  ///
+  /// When ON, the background isolate (the foreground-service `TaskHandler`) OWNS
+  /// receiving and binds the LocalSend port, so the main-isolate server MUST be
+  /// stopped first to free the port. When OFF, the main-isolate server takes
+  /// over again. [ref] is required so this can coordinate the main [serverProvider]
+  /// (this is an Android-only concern; it is a no-op on other platforms).
+  ///
+  /// Called from a foreground context (the settings toggle), so it is safe to
+  /// request permissions and start/stop the foreground service here.
+  Future<void> setRunInBackground(bool value, Ref ref) async {
+    await _persistence.setRunInBackground(value);
+    state = state.copyWith(
+      runInBackground: value,
+    );
+
+    if (!checkPlatform([TargetPlatform.android])) {
+      return;
+    }
+
+    if (value) {
+      // Free the port before the background isolate tries to bind it.
+      await ref.notifier(serverProvider).stopServer();
+      await requestBackgroundPermissions();
+      await startBackgroundService();
+    } else {
+      // Background isolate releases the port; hand receiving back to the main server.
+      await stopBackgroundService();
+      await ref.notifier(serverProvider).startServerFromSettings();
+    }
   }
 
   Future<void> setQuickSave(bool quickSave) async {

@@ -392,11 +392,8 @@ class TranslationsReceivePageEn {
   // Translations
 
   /// en: '(one) {wants to send you a file} (other) {wants to send you {n} files}'
-  String subTitle({required num n}) => (_root.$meta.cardinalResolver ?? PluralResolvers.cardinal('en'))(
-    n,
-    one: 'wants to send you a file',
-    other: 'wants to send you ${n} files',
-  );
+  String subTitle({required num n}) =>
+      (_root.$meta.cardinalResolver ?? PluralResolvers.cardinal('en'))(n, one: 'wants to send you a file', other: 'wants to send you ${n} files');
 
   /// en: 'sent you a message:'
   String get subTitleMessage => 'sent you a message:';
@@ -1049,6 +1046,13 @@ class TranslationsSettingsTabReceiveEn {
 
   /// en: 'Save to history'
   String get saveToHistory => 'Save to history';
+
+  /// en: 'Keep receiving in the background'
+  String get runInBackground => 'Keep receiving in the background';
+
+  /// en: 'Runs a foreground service so LocalSend can keep receiving files while the app is in the background. A persistent notification is shown while active.'
+  String get runInBackgroundDescription =>
+      'Runs a foreground service so LocalSend can keep receiving files while the app is in the background. A persistent notification is shown while active.';
 }
 
 // Path: settingsTab.send
